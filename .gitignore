@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# PyInstaller 中间产物（保留 dist 下的成品 exe）
+build/
+*.manifest
+
+# 系统
+Thumbs.db
+.DS_Store
