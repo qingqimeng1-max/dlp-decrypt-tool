@@ -186,6 +186,8 @@ class DecryptApp:
 
         self.files = []           # 待处理文件列表
         self.running = False
+        self._stop = None         # 解密停止信号（threading.Event）
+        self._phase = ""          # 当前进度阶段：prepare / decrypt
         self._selected = set()    # 选中的文件下标
         self._rows = []           # 行容器列表
         self._badges = {}         # 下标 → 状态徽章
@@ -303,6 +305,9 @@ class DecryptApp:
         # 主操作（左对齐）
         self.btn_start = self._btn(bar, "Primary.TButton", "开始解密", self.start_decrypt)
         self.btn_start.pack(side="left", padx=(0, 8))
+        self.btn_stop = self._btn(bar, "Secondary.TButton", "停止", self.stop_decrypt)
+        self.btn_stop.state(["disabled"])
+        self.btn_stop.pack(side="left", padx=(0, 8))
         self._btn(bar, "Secondary.TButton", "打开明文区", self.open_plaintext_dir).pack(side="left", padx=(0, 8))
         # 文件管理（加细分隔，与主操作区分）
         self._btn(bar, "Ghost.TButton", "添加文件", self.add_files).pack(side="left", padx=(16, 0))
@@ -620,30 +625,49 @@ class DecryptApp:
                 messagebox.showerror("错误", f"无法创建明文区 {dc.PLAINTEXT_DIR}:\n{e}")
                 return
         self.running = True
+        self._stop = threading.Event()
+        self._phase = ""
         self.btn_start.config(state="disabled")
+        self.btn_stop.state(["!disabled"])
         self._set_pill("running")
-        self.lbl_sum.config(text="解密中…")
-        self.progress["maximum"] = len(self.files)
+        self.lbl_sum.config(text="正在准备文件…")
+        self.progress["maximum"] = max(len(self.files), 1)
         self.progress["value"] = 0
         self.lbl_prog.config(text="0 / 0")
         self.lbl_pct.config(text="0%")
         files_snapshot = list(self.files)
-        t = threading.Thread(target=self._worker, args=(files_snapshot,), daemon=True)
+        t = threading.Thread(target=self._worker, args=(files_snapshot,),
+                             daemon=True)
         t.start()
 
+    def stop_decrypt(self):
+        """请求停止：当前文件处理完后不再继续。"""
+        if self.running and self._stop is not None:
+            self._stop.set()
+            self.btn_stop.state(["disabled"])
+            self.lbl_sum.config(text="正在停止…")
+            self.log("⏹ 已请求停止，等待当前文件完成…")
+
     def _worker(self, files):
-        def progress_cb(done, total_, cur):
-            self.root.after(0, self._update_progress, done, total_, cur)
+        def progress_cb(done, total_, cur, phase="decrypt"):
+            self.root.after(0, self._update_progress, done, total_, cur, phase)
 
         def log_cb(msg):
             self.root.after(0, self.log, msg)
 
-        ok, fail, results = dc.decrypt_batch(files, progress_cb=progress_cb,
-                                             log_cb=log_cb, timeout=60)
+        ok, fail, results = dc.decrypt_batch(
+            files, progress_cb=progress_cb, log_cb=log_cb,
+            should_stop=lambda: self._stop.is_set() if self._stop else False)
         self.root.after(0, self._finish, ok, fail, results)
 
-    def _update_progress(self, done, total, cur):
-        self.progress["maximum"] = total
+    def _update_progress(self, done, total, cur, phase="decrypt"):
+        # 阶段切换时重置进度条，避免"准备阶段已 100%，解密阶段却不动"的假死观感
+        if phase != self._phase:
+            self._phase = phase
+            self.progress["value"] = 0
+            if phase == "decrypt":
+                self.lbl_sum.config(text="正在解密…")
+        self.progress["maximum"] = max(total, 1)
         self.progress["value"] = done
         self.lbl_prog.config(text=f"{done} / {total}")
         pct = int(round(done / total * 100)) if total else 0
@@ -655,16 +679,24 @@ class DecryptApp:
     def _finish(self, ok, fail, results):
         self.running = False
         self.btn_start.config(state="normal")
+        self.btn_stop.state(["disabled"])
         self.progress["value"] = self.progress["maximum"]
         self._set_pill("fail" if fail else "done")
-        self.lbl_sum.config(text=f"成功 {ok} · 失败 {fail}")
-        for i, (src, okf, dest, msg) in enumerate(results):
-            self._set_status(i, "ok" if okf else "fail")
-        if fail:
-            self._toast(f"解密完成：成功 {ok}，失败 {fail}", kind="fail")
+        stopped = self._stop is not None and self._stop.is_set()
+        summary = f"成功 {ok} · 失败 {fail}" + ("（已手动停止）" if stopped else "")
+        self.lbl_sum.config(text=summary)
+        # 按源文件路径回填状态（结果只含加密文件，不能用下标直接对应）
+        for src, okf, dest, msg in results:
+            idx = self._idx_by_path.get(os.path.abspath(src))
+            if idx is not None:
+                self._set_status(idx, "ok" if okf else "fail")
+        if stopped:
+            self._toast(f"已停止：{summary}", kind="warn")
+        elif fail:
+            self._toast(f"解密完成：{summary}", kind="fail")
         else:
             self._toast(f"全部解密成功，共 {ok} 个文件")
-        self.log(f"完成：成功 {ok}，失败 {fail}")
+        self.log(f"完成：{summary}")
 
     # ---------- Toast / 日志 ----------
     def _footer(self):
@@ -726,12 +758,15 @@ class DecryptApp:
             self.txt_log.tag_configure("warn", foreground="#854F0B")
             self.txt_log.tag_configure("info", foreground="#6B7280")
         self.txt_log.config(state="normal")
+        text = msg.strip()          # 明细行带缩进，按标记判定颜色时需去空白
         tag = "info"
-        if msg.startswith("✓"):
+        if text.startswith("✓"):
             tag = "ok"
-        elif msg.startswith("✗") or "失败" in msg:
+        elif text.startswith("✗") or "失败" in text:
             tag = "fail"
-        elif "提示" in msg or "未找到" in msg or "WPS" in msg:
+        elif text.startswith("⏹"):
+            tag = "warn"
+        elif "提示" in text or "未找到" in text or "WPS" in text:
             tag = "warn"
         self.txt_log.insert(tk.END, msg + "\n", tag)
         self.txt_log.see(tk.END)
