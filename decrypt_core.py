@@ -8,10 +8,12 @@ DLP 批量解密核心模块（pywin32 COM 分组批量版 + WPS PDF 启动器�
      实测 DispatchEx 启动的实例不在 DLP 解密路径上，无法触发解密。
      PDF 用命令行启动 wps.exe 打开，wps 读取文件时驱动即落盘解密，wps 随后自行退出。
 """
+import glob
 import os
 import shutil
 import subprocess
 import time
+import winreg
 
 import pythoncom
 import win32com.client
@@ -60,18 +62,25 @@ PDF_POLL_TIMEOUT = 20          # 单个 PDF 最长等待（秒）
 PDF_EXIT_GRACE = 2.5           # wps.exe 退出后仍允许落盘的宽限时间（秒）
 PDF_CLOSE_WAIT = 3.0           # 解密成功后等待 wps.exe 自行退出的时间（秒）
 PDF_CONFIRM_DELAY = 0.5        # 判定成功后二次确认间隔（过滤瞬时明文被回滚）
+PDF_MAX_RETRY = 3              # 单个 PDF 失败重试次数（wps 触发驱动解密是概率性的）
 
 # 打开每个文件后等待驱动解密落盘的秒数
 OPEN_SETTLE = 0.8
+# 单个文件打开后等待驱动落盘解密的最长秒数（打开→轮询文件头→关闭）
+COM_FILE_TIMEOUT = 15
 
 
 # ---------- 文件检测 ----------
+def _ext(path):
+    return os.path.splitext(path)[1].lower()
+
+
 def is_supported(path):
-    return os.path.splitext(path)[1].lower() in EXT_MAP
+    return _ext(path) in EXT_MAP
 
 
 def get_office_type(path):
-    return EXT_MAP.get(os.path.splitext(path)[1].lower())
+    return EXT_MAP.get(_ext(path))
 
 
 def read_header(path, n=8):
@@ -85,8 +94,7 @@ def read_header(path, n=8):
 
 def is_encrypted(path):
     """DLP 加密判定：文件头为 88 7D 1C 特征。"""
-    head = read_header(path, 3)
-    return head is not None and head == ENCRYPTED_MAGIC
+    return read_header(path, 3) == ENCRYPTED_MAGIC
 
 
 def is_decrypted_ok(path):
@@ -106,47 +114,30 @@ _wps_tried = False
 def find_wps_exe():
     """
     定位 WPS 主程序 wps.exe（在 DLP 白名单内，可触发 PDF 落盘解密）。
-    依次尝试常见安装路径与注册表，找不到返回 None。结果缓存。
+    依次尝试常见安装路径、注册表 App Paths、PATH，找不到返回 None。结果缓存。
     """
     global _wps_cache, _wps_tried
     if _wps_tried:
         return _wps_cache
     _wps_tried = True
 
-    import glob
     for pat in WPS_SEARCH_PATTERNS:
-        try:
-            found = glob.glob(os.path.expandvars(pat))
-            if found:
-                _wps_cache = found[0]
-                return _wps_cache
-        except Exception:
-            continue
-    # 注册表 App Paths
-    try:
-        import winreg
-        for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-            try:
-                with winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion\App Paths\wps.exe") as k:
-                    v, _ = winreg.QueryValueEx(k, "")
-                    if v and os.path.exists(v):
-                        _wps_cache = v
-                        return _wps_cache
-            except Exception:
-                continue
-    except Exception:
-        pass
-    # PATH
-    try:
-        import shutil as _sh
-        p = _sh.which("wps.exe")
-        if p:
-            _wps_cache = p
+        found = glob.glob(os.path.expandvars(pat))
+        if found:
+            _wps_cache = found[0]
             return _wps_cache
-    except Exception:
-        pass
-    _wps_cache = None
-    return None
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(root, r"Software\Microsoft\Windows\CurrentVersion"
+                                     r"\App Paths\wps.exe") as k:
+                v, _ = winreg.QueryValueEx(k, "")
+                if v and os.path.exists(v):
+                    _wps_cache = v
+                    return _wps_cache
+        except OSError:
+            continue
+    _wps_cache = shutil.which("wps.exe")
+    return _wps_cache
 
 
 # ---------- 明文区工具 ----------
@@ -189,8 +180,24 @@ def cleanup_office_lock(dest_path, retries=8, delay=0.5):
 
 
 # ---------- COM 批量处理 ----------
-# 单个文件打开后等待驱动落盘解密的最长秒数（打开→轮询文件头→关闭）
-COM_FILE_TIMEOUT = 15
+def _com_open(app, progid, path):
+    """以只读方式用 Office 打开文件，返回文档对象。"""
+    if progid == "Excel.Application":
+        return app.Workbooks.Open(path, 0, True)          # ReadOnly
+    if progid == "Word.Application":
+        return app.Documents.Open(path, False, True)      # ReadOnly
+    return app.Presentations.Open(path, True, False, False)  # ReadOnly
+
+
+def _com_close(doc, progid):
+    """关闭文档（不保存），失败静默。"""
+    try:
+        if progid == "PowerPoint.Application":
+            doc.Close()
+        else:
+            doc.Close(False)
+    except Exception:
+        pass
 
 
 def com_open_close(progid, filepaths, settle=OPEN_SETTLE, timeout=COM_FILE_TIMEOUT):
@@ -206,37 +213,19 @@ def com_open_close(progid, filepaths, settle=OPEN_SETTLE, timeout=COM_FILE_TIMEO
     try:
         app = win32com.client.Dispatch(progid)
         # 抑制弹窗
-        try:
-            app.Visible = False
-        except Exception:
-            pass
-        try:
-            app.DisplayAlerts = False
-        except Exception:
-            pass
+        for attr in ("Visible", "DisplayAlerts"):
+            try:
+                setattr(app, attr, False)
+            except Exception:
+                pass
 
         for f in filepaths:
             try:
-                if progid == "Excel.Application":
-                    doc = app.Workbooks.Open(f, 0, True)  # ReadOnly
-                elif progid == "Word.Application":
-                    doc = app.Documents.Open(f, False, True)  # ReadOnly
-                else:  # PowerPoint
-                    doc = app.Presentations.Open(f, True, False, False)  # ReadOnly
-                # 轮询等待驱动解密落盘（文件头 88 7D 1C → 明文 magic）
+                doc = _com_open(app, progid, f)
                 deadline = time.time() + max(timeout, 5)
                 while time.time() < deadline and not is_decrypted_ok(f):
                     time.sleep(0.3)
-                # 关闭文档（不保存）
-                try:
-                    if progid == "Excel.Application":
-                        doc.Close(False)
-                    elif progid == "Word.Application":
-                        doc.Close(False)
-                    else:
-                        doc.Close()
-                except Exception:
-                    pass
+                _com_close(doc, progid)
                 opened += 1
             except Exception:
                 continue  # 单个文件失败不中断整组
@@ -247,15 +236,39 @@ def com_open_close(progid, filepaths, settle=OPEN_SETTLE, timeout=COM_FILE_TIMEO
                 app.Quit()
             except Exception:
                 pass
-            try:
-                pythoncom.CoUninitialize()
-            except Exception:
-                pass
+            pythoncom.CoUninitialize()
 
 
 # ---------- PDF 批量处理（WPS 启动器） ----------
-# 单个 PDF 解密失败后的重试次数（wps 触发驱动解密是概率性的，重试兜底）
-PDF_MAX_RETRY = 3
+def _wait_exit(proc, secs):
+    """等待进程自然退出，返回是否已退出。"""
+    if proc is None or proc.poll() is not None:
+        return True
+    try:
+        proc.wait(timeout=secs)
+    except Exception:
+        pass
+    return proc.poll() is not None
+
+
+def _wait_pdf_decrypted(f, proc, timeout):
+    """轮询等待单个 PDF 落盘解密成功，返回是否成功。"""
+    deadline = time.time() + timeout
+    exited_at = None
+    while time.time() < deadline:
+        if is_decrypted_ok(f):
+            # 二次确认：防止"瞬时明文后被驱动回滚"的误判
+            time.sleep(PDF_CONFIRM_DELAY)
+            if is_decrypted_ok(f):
+                return True
+        if proc.poll() is not None:
+            if exited_at is None:
+                exited_at = time.time()
+            # 进程已退出，再给驱动一点落盘时间
+            if time.time() - exited_at > PDF_EXIT_GRACE:
+                break
+        time.sleep(PDF_POLL_INTERVAL)
+    return False
 
 
 def pdf_open_close(pdf_paths, wps_exe, timeout=PDF_POLL_TIMEOUT):
@@ -272,18 +285,8 @@ def pdf_open_close(pdf_paths, wps_exe, timeout=PDF_POLL_TIMEOUT):
     opened = 0
     last_proc = None
 
-    def _wait_exit(proc, secs):
-        """等待进程自然退出，返回是否已退出。"""
-        if proc is None or proc.poll() is not None:
-            return True
-        try:
-            proc.wait(timeout=secs)
-        except Exception:
-            pass
-        return proc.poll() is not None
-
     for f in pdf_paths:
-        # 1. 等上一个 wps 自然退出（防单实例劫持）
+        # 等上一个 wps 自然退出（防单实例劫持）
         _wait_exit(last_proc, 10)
         ok = False
         proc = None
@@ -293,24 +296,7 @@ def pdf_open_close(pdf_paths, wps_exe, timeout=PDF_POLL_TIMEOUT):
             except Exception:
                 break
             last_proc = proc
-            deadline = time.time() + timeout
-            done = False
-            exited_at = None
-            while time.time() < deadline:
-                if is_decrypted_ok(f):
-                    # 二次确认：防止"瞬时明文后被驱动回滚"的误判
-                    time.sleep(PDF_CONFIRM_DELAY)
-                    if is_decrypted_ok(f):
-                        done = True
-                        break
-                if proc.poll() is not None:
-                    if exited_at is None:
-                        exited_at = time.time()
-                    # 进程已退出，再给驱动一点落盘时间
-                    if time.time() - exited_at > PDF_EXIT_GRACE:
-                        break
-                time.sleep(PDF_POLL_INTERVAL)
-            if done:
+            if _wait_pdf_decrypted(f, proc, timeout):
                 ok = True
                 break
             # 失败：等进程自然退出（超时才强杀；文件没解密，强杀无回滚损失）
@@ -328,6 +314,31 @@ def pdf_open_close(pdf_paths, wps_exe, timeout=PDF_POLL_TIMEOUT):
     # 收尾：等最后一个 wps 自然退出
     _wait_exit(last_proc, 10)
     return opened, len(pdf_paths) - opened
+
+
+# ---------- 文件收集 ----------
+def collect_files(paths):
+    """收集待处理文件列表：文件直接加入；文件夹递归扫描支持的 Office 文件。"""
+    files = []
+    for p in paths:
+        p = p.strip().strip('"')
+        if not p or not os.path.exists(p):
+            continue
+        if os.path.isfile(p):
+            if is_supported(p):
+                files.append(p)
+        elif os.path.isdir(p):
+            for root, _, fnames in os.walk(p):
+                files.extend(os.path.join(root, fn) for fn in fnames
+                             if is_supported(os.path.join(root, fn)))
+    # 去重保序
+    seen, result = set(), []
+    for f in files:
+        key = os.path.abspath(f).lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(f)
+    return result
 
 
 # ---------- 批量解密 ----------
@@ -356,17 +367,13 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, timeout=120):
         if not is_encrypted(f):
             if log_cb:
                 log_cb(f"    ↷ 未加密，跳过: {os.path.basename(f)}")
-            if progress_cb:
-                progress_cb(i, total, f)
-            continue
-        dest, err = prepare_dest(f)
-        if err:
-            if log_cb:
-                log_cb(f"    ✗ {err}")
-            if progress_cb:
-                progress_cb(i, total, f)
-            continue
-        prepared.append((f, dest))
+        else:
+            dest, err = prepare_dest(f)
+            if err:
+                if log_cb:
+                    log_cb(f"    ✗ {err}")
+            else:
+                prepared.append((f, dest))
         if progress_cb:
             progress_cb(i, total, f)
 
@@ -375,16 +382,27 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, timeout=120):
             log_cb("没有需要解密的加密文件。")
         return 0, 0, []
 
-    # 2. 按 Office 类型分组
+    # 2. 按 Office 类型分组处理
     groups = {}
     for s, d in prepared:
-        t = get_office_type(s)
-        groups.setdefault(t, []).append((s, d))
+        groups.setdefault(get_office_type(s), []).append((s, d))
 
     ok = fail = 0
     results = []
     done_count = 0
     total_work = len(prepared)
+
+    def _fail_group(items, msg):
+        """整组失败：逐个记录结果并上报进度。"""
+        nonlocal fail, done_count
+        for s, d in items:
+            fail += 1
+            done_count += 1
+            results.append((s, False, d, msg))
+            if log_cb:
+                log_cb(f"    ✗ {os.path.basename(s)}")
+            if progress_cb:
+                progress_cb(done_count, total_work, s)
 
     for office_type, items in groups.items():
         dests = [d for _, d in items]
@@ -392,28 +410,14 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, timeout=120):
             # PDF：用 WPS(wps.exe) 触发驱动解密（wps 在白名单内）
             wps_exe = find_wps_exe()
             if not wps_exe:
-                for s, d in items:
-                    fail += 1
-                    done_count += 1
-                    results.append((s, False, d, "未找到 WPS(wps.exe)，无法解密 PDF"))
-                    if log_cb:
-                        log_cb(f"    ✗ {os.path.basename(s)}")
-                    if progress_cb:
-                        progress_cb(done_count, total_work, s)
+                _fail_group(items, "未找到 WPS(wps.exe)，无法解密 PDF")
                 continue
             if log_cb:
                 log_cb(f"\n[pdf] 启动 WPS 处理 {len(dests)} 个 PDF…")
             try:
                 pdf_open_close(dests, wps_exe, timeout=PDF_POLL_TIMEOUT)
             except Exception as e:
-                for s, d in items:
-                    fail += 1
-                    done_count += 1
-                    results.append((s, False, d, f"启动 WPS 失败: {e}"))
-                    if log_cb:
-                        log_cb(f"    ✗ {os.path.basename(s)}")
-                    if progress_cb:
-                        progress_cb(done_count, total_work, s)
+                _fail_group(items, f"启动 WPS 失败: {e}")
                 continue
         else:
             progid = COM_PROGID[office_type]
@@ -422,14 +426,7 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, timeout=120):
             try:
                 _opened, _failed = com_open_close(progid, dests, timeout=COM_FILE_TIMEOUT)
             except Exception as e:
-                for s, d in items:
-                    fail += 1
-                    done_count += 1
-                    results.append((s, False, d, f"启动 Office 失败: {e}"))
-                    if log_cb:
-                        log_cb(f"    ✗ {os.path.basename(s)}")
-                    if progress_cb:
-                        progress_cb(done_count, total_work, s)
+                _fail_group(items, f"启动 Office 失败: {e}")
                 continue
 
         # 3. 处理完后统一轮询确认解密落盘（COM 关闭后驱动已落盘，这里做兜底确认）
@@ -465,36 +462,9 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, timeout=120):
     return ok, fail, results
 
 
-# ---------- 文件收集 ----------
-def collect_files(paths):
-    """收集待处理文件列表：文件直接加入；文件夹递归扫描支持的 Office 文件。"""
-    files = []
-    for p in paths:
-        p = p.strip().strip('"')
-        if not p or not os.path.exists(p):
-            continue
-        if os.path.isfile(p):
-            if is_supported(p):
-                files.append(p)
-        elif os.path.isdir(p):
-            for root, _, fnames in os.walk(p):
-                for fn in fnames:
-                    full = os.path.join(root, fn)
-                    if is_supported(full):
-                        files.append(full)
-    # 去重保序
-    seen, result = set(), []
-    for f in files:
-        key = os.path.abspath(f).lower()
-        if key not in seen:
-            seen.add(key)
-            result.append(f)
-    return result
-
-
-# ---------- 单文件解密（兼容旧调用） ----------
-def decrypt_one(src_path, timeout=60, poll_interval=1.0):
-    """解密单个文件（复用 COM 批量逻辑）。返回 (成功?, 目标路径, 消息)。"""
+# ---------- 单文件解密（复用批量逻辑） ----------
+def decrypt_one(src_path, timeout=60):
+    """解密单个文件。返回 (成功?, 目标路径, 消息)。"""
     if not os.path.exists(src_path):
         return False, "", "源文件不存在"
     if not is_supported(src_path):
@@ -504,32 +474,29 @@ def decrypt_one(src_path, timeout=60, poll_interval=1.0):
     dest, err = prepare_dest(src_path)
     if err:
         return False, "", err
-    office_type = get_office_type(src_path)
-    if office_type == "pdf":
-        wps_exe = find_wps_exe()
-        if not wps_exe:
-            cleanup_office_lock(dest)
-            return False, dest, "未找到 WPS(wps.exe)，无法解密 PDF"
+
+    try:
+        if get_office_type(src_path) == "pdf":
+            wps_exe = find_wps_exe()
+            if not wps_exe:
+                return False, dest, "未找到 WPS(wps.exe)，无法解密 PDF"
+            try:
+                pdf_open_close([dest], wps_exe, timeout=timeout)
+            except Exception as e:
+                return False, dest, f"启动 WPS 失败: {e}"
+            time.sleep(1)
+            if is_decrypted_ok(dest):
+                return True, dest, f"解密成功 → {dest}"
+            return False, dest, "解密失败：文件未被 WPS 解密"
+
+        progid = COM_PROGID[get_office_type(src_path)]
         try:
-            pdf_open_close([dest], wps_exe, timeout=timeout)
+            com_open_close(progid, [dest], timeout=timeout)
         except Exception as e:
-            cleanup_office_lock(dest)
-            return False, dest, f"启动 WPS 失败: {e}"
+            return False, dest, f"启动 Office 失败: {e}"
         time.sleep(1)
         if is_decrypted_ok(dest):
-            cleanup_office_lock(dest)
             return True, dest, f"解密成功 → {dest}"
+        return False, dest, "解密失败：文件未被 Office 解密"
+    finally:
         cleanup_office_lock(dest)
-        return False, dest, "解密失败：文件未被 WPS 解密"
-    progid = COM_PROGID[office_type]
-    try:
-        com_open_close(progid, [dest], timeout=timeout)
-    except Exception as e:
-        cleanup_office_lock(dest)
-        return False, dest, f"启动 Office 失败: {e}"
-    time.sleep(1)
-    if is_decrypted_ok(dest):
-        cleanup_office_lock(dest)
-        return True, dest, f"解密成功 → {dest}"
-    cleanup_office_lock(dest)
-    return False, dest, "解密失败：文件未被 Office 解密"

@@ -142,10 +142,10 @@ if __name__ == "__main__":
     # 命令行使用：python context_menu.py [register|unregister]
     action = sys.argv[1] if len(sys.argv) > 1 else "register"
     if action == "unregister":
-        n, fs = unregister()
+        n, _ = unregister()
         print("已移除 %d 个右键菜单项" % n)
     else:
-        n, fs = register()
+        n, _ = register()
         print("已注册 %d 个右键菜单项" % n)
     if fs:
         print("失败：", fs)

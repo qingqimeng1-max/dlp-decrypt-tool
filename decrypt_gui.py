@@ -41,6 +41,39 @@ TYPE_STYLE = {
 FONT = "Microsoft YaHei UI"
 FONT_MONO = "Consolas"
 
+# ---------- 首次启动引导 ----------
+# 标记文件：存在 = 用户已完成初始配置确认，不再自动弹出引导
+GUIDE_FLAG_DIR = os.path.join(
+    os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "DLPDecryptTool")
+GUIDE_FLAG_FILE = os.path.join(GUIDE_FLAG_DIR, "initialized.flag")
+
+GUIDE_TEXT = (
+    "首次使用本工具前，请先完成一次初始配置（只需一次）：\n"
+    "\n"
+    "第 1 步　使用绿盾正常流程申请解密一个文件，申请成功后保存。\n"
+    "\n"
+    "第 2 步　导出方式选择「另存为」，保存位置指定为：\n"
+    "        C:\\解密文件\n"
+    "        （该位置无需手动创建，绿盾会自动创建。）\n"
+    "\n"
+    "第 3 步　完成上述配置后，C:\\解密文件 即为本工具后续的解密目录，\n"
+    "        之后即可正常使用本工具进行批量解密。"
+)
+
+
+def _is_first_run():
+    return not os.path.exists(GUIDE_FLAG_FILE)
+
+
+def _mark_initialized():
+    try:
+        os.makedirs(GUIDE_FLAG_DIR, exist_ok=True)
+        with open(GUIDE_FLAG_FILE, "w", encoding="utf-8") as f:
+            f.write("initialized")
+    except Exception:
+        pass
+
+
 # ---------- 单实例 ----------
 # 锁文件：保证全系统只有一个主窗口（右键多个文件也只开一个窗口）
 # 用"独占创建锁文件 + 写 PID + 检测 PID 存活"实现，纯标准库，打包零依赖风险
@@ -49,7 +82,7 @@ LOCK_FILE = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")),
 # 队列文件：第二实例把文件路径写进来，主实例轮询拾取（实现"转发给已开窗口"）
 QUEUE_FILE = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")),
                           "dlp_decrypt_queue.txt")
-_MAIN_LOCK = None  # 主实例持有的锁标记（防 GC/防误删）
+_MAIN_LOCK = False  # 主实例持有的锁标记（退出时据此释放锁文件）
 
 
 def _pid_alive(pid):
@@ -145,7 +178,6 @@ class DecryptApp:
         root.configure(bg=PAGE_BG)
 
         # 拖拽支持（tkinterdnd2 可选）
-        self.dnd_available = False
         try:
             import tkinterdnd2  # noqa: F401
             self.dnd_available = True
@@ -277,20 +309,20 @@ class DecryptApp:
         self._btn(bar, "Ghost.TButton", "添加文件夹", self.add_folder).pack(side="left")
         self._btn(bar, "Ghost.TButton", "移除选中", self.remove_selected).pack(side="left")
         self._btn(bar, "Ghost.TButton", "清空", self.clear_list).pack(side="left")
-        # 右：统计 + 右上角的设置入口（注册/卸载右键菜单）
+        # 右：统计 + 右上角的设置入口（首次说明 / 注册卸载右键菜单）
         self.lbl_count = tk.Label(bar, text="共 0 个文件", bg=PAGE_BG,
                                   fg=TEXT_3, font=(FONT, 9))
         self.lbl_count.pack(side="right", padx=(8, 0))
-
-        # 设置点（右上角小齿轮），点开是注册/卸载
-        self.btn_settings = self._btn(bar, "Ghost.TButton", "⋯", lambda: self._open_settings_menu())
+        self.btn_settings = self._btn(bar, "Ghost.TButton", "⋯",
+                                      self._open_settings_menu)
         self.btn_settings.pack(side="right")
 
     def _open_settings_menu(self):
-        """设置菜单（注册/卸载右键）"""
+        """设置菜单（首次使用说明 / 注册卸载右键 / 打开明文区）"""
         menu = tk.Menu(self.root, tearoff=0, bg=SURFACE_BG, fg=TEXT_1,
                        activebackground=HOVER_BG, activeforeground=TEXT_1,
                        relief="flat", bd=1, font=(FONT, 9))
+        menu.add_command(label="  首次使用说明", command=self.show_first_run_guide)
         menu.add_command(label="  注册右键菜单", command=self.register_menu)
         menu.add_command(label="  卸载右键菜单", command=self.unregister_menu)
         menu.add_separator()
@@ -367,6 +399,51 @@ class DecryptApp:
     def _on_drop(self, event):
         paths = self.root.tk.splitlist(event.data)
         self._add_paths(paths)
+
+    # ---------- 首次启动引导 ----------
+    def show_first_run_guide(self):
+        """首次启动引导弹窗（模态）。用户确认完成后写入标记，之后不再自动弹出。"""
+        win = tk.Toplevel(self.root)
+        win.title("首次使用 · 初始配置引导")
+        win.configure(bg=SURFACE_BG)
+        win.resizable(False, False)
+        win.transient(self.root)
+
+        head = tk.Frame(win, bg=SURFACE_BG)
+        head.pack(fill="x", padx=26, pady=(24, 6))
+        tk.Label(head, text="欢迎使用 DLP 批量解密工具", bg=SURFACE_BG, fg=TEXT_1,
+                 font=(FONT, 13, "bold")).pack(anchor="w")
+        tk.Label(head, text="检测到这是首次启动，请按以下步骤完成初始配置：",
+                 bg=SURFACE_BG, fg=TEXT_2, font=(FONT, 10)).pack(anchor="w",
+                                                                 pady=(4, 0))
+
+        body = tk.Frame(win, bg=SURFACE_BG)
+        body.pack(fill="x", padx=26, pady=(6, 2))
+        tk.Label(body, text=GUIDE_TEXT, bg=SURFACE_BG, fg=TEXT_1,
+                 font=(FONT, 10), justify="left", anchor="w").pack(fill="x")
+        tk.Label(win, text="提示：说明内容可随时在右上角「⋯ → 首次使用说明」查看。",
+                 bg=SURFACE_BG, fg=TEXT_3, font=(FONT, 8)).pack(anchor="w",
+                                                                padx=26, pady=(2, 0))
+
+        btns = tk.Frame(win, bg=SURFACE_BG)
+        btns.pack(fill="x", padx=26, pady=(14, 22))
+
+        def _done():
+            _mark_initialized()
+            win.destroy()
+
+        ttk.Button(btns, text="我已完成配置，开始使用", style="Primary.TButton",
+                   command=_done).pack(side="right")
+        ttk.Button(btns, text="打开明文区", style="Secondary.TButton",
+                   command=self.open_plaintext_dir).pack(side="left")
+
+        # 居中于主窗口
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        win.grab_set()
+        self.root.wait_window(win)
 
     # ---------- 文件列表 ----------
     def _refresh_list(self):
@@ -475,7 +552,7 @@ class DecryptApp:
         if not files:
             self.log("未找到支持的 Excel/Word/PPT/PDF 文件。")
             return
-        existing = set(os.path.abspath(f).lower() for f in self.files)
+        existing = {os.path.abspath(f).lower() for f in self.files}
         added = 0
         for f in files:
             key = os.path.abspath(f).lower()
@@ -493,7 +570,7 @@ class DecryptApp:
             if 0 <= idx < len(self.files):
                 self.files.pop(idx)
         self._refresh_list()
-        self.log(f"已移除选中文件。")
+        self.log("已移除选中文件。")
 
     def clear_list(self):
         self.files = []
@@ -702,37 +779,37 @@ class DecryptApp:
         self.root.after(600, self._poll_queue)
 
 
+def _run_register_cli(args):
+    """无界面模式：注册/卸载右键菜单（即时命令，不排队）。"""
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        import context_menu as cm
+        if "--register" in args:
+            n, fails = cm.register()
+            msg = f"右键菜单注册完成：成功 {n} 处。"
+            if fails:
+                msg += "\n失败：\n" + "\n".join(fails[:8])
+            messagebox.showinfo("注册右键菜单", msg)
+        if "--unregister" in args:
+            n, fails = cm.unregister()
+            msg = f"右键菜单已移除：{n} 处。"
+            if fails:
+                msg += "\n失败：\n" + "\n".join(fails[:8])
+            messagebox.showinfo("卸载右键菜单", msg)
+    except Exception as e:
+        messagebox.showerror("错误", f"右键菜单模块加载失败：{e}")
+    finally:
+        root.destroy()
+
+
 def main():
     global _MAIN_LOCK
     args = sys.argv[1:]
 
     # 无界面模式：注册/卸载右键菜单（即时命令，不排队）
     if any(a in args for a in ("--register", "--unregister")):
-        import tkinter as tk
-        from tkinter import messagebox
-        try:
-            import context_menu as cm
-        except Exception as e:
-            tk.Tk().withdraw()
-            messagebox.showerror("错误", f"右键菜单模块加载失败：{e}")
-            return
-        root = tk.Tk()
-        root.withdraw()
-        try:
-            if "--register" in args:
-                n, fails = cm.register()
-                msg = f"右键菜单注册完成：成功 {n} 处。"
-                if fails:
-                    msg += "\n失败：\n" + "\n".join(fails[:8])
-                messagebox.showinfo("注册右键菜单", msg)
-            if "--unregister" in args:
-                n, fails = cm.unregister()
-                msg = f"右键菜单已移除：{n} 处。"
-                if fails:
-                    msg += "\n失败：\n" + "\n".join(fails[:8])
-                messagebox.showinfo("卸载右键菜单", msg)
-        finally:
-            root.destroy()
+        _run_register_cli(args)
         return
 
     # 命令行传入的文件/文件夹路径（右键"一键解密"传参）
@@ -743,7 +820,7 @@ def main():
         if path_args:
             _enqueue_paths(path_args)
         return
-    _MAIN_LOCK = True  # 持有锁标记，退出时释放
+    _MAIN_LOCK = True
 
     # 尝试启用拖拽（tkinterdnd2 可选依赖）
     try:
@@ -755,6 +832,11 @@ def main():
     except Exception:
         root = tk.Tk()
         app = DecryptApp(root)
+
+    # 首次启动：显示初始配置引导（用户确认后写入标记，之后不再自动弹出；
+    # 未确认直接关窗则下次启动仍会提示）
+    if _is_first_run():
+        app.show_first_run_guide()
 
     # 命令行传入的文件/文件夹：自动加入列表，并自动开始解密（右键"一键解密"流程）
     if path_args:
@@ -775,11 +857,11 @@ def main():
         root.mainloop()
     finally:
         # 兜底释放（异常/正常退出都清理）
-        try:
-            if _MAIN_LOCK and os.path.exists(LOCK_FILE):
+        if _MAIN_LOCK:
+            try:
                 os.remove(LOCK_FILE)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
