@@ -48,6 +48,43 @@ COM_PROGID = {"excel": "Excel.Application",
               "word": "Word.Application",
               "ppt": "PowerPoint.Application"}
 
+# COM 类型 → 对应进程名（用于区分"工具新建实例"与"用户已打开实例"）
+_APP_PROCESS = {"excel": "EXCEL.EXE", "word": "WINWORD.EXE", "ppt": "POWERPNT.EXE"}
+
+
+def _office_pids(process_name):
+    """枚举指定 Office 进程的 PID 集合（Toolhelp 快照，失败返回空集）。"""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.windll.kernel32
+    TH32CS_SNAPPROCESS = 0x2
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", wintypes.WCHAR * 260)]
+
+    try:
+        snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap in (0, -1):
+            return set()
+        pids = set()
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        ok = kernel32.Process32FirstW(snap, ctypes.byref(entry))
+        while ok:
+            if entry.szExeFile.upper() == process_name:
+                pids.add(entry.th32ProcessID)
+            ok = kernel32.Process32NextW(snap, ctypes.byref(entry))
+        kernel32.CloseHandle(snap)
+        return pids
+    except Exception:
+        return set()
+
 # PowerPoint 另存为格式（Presentation 无 SaveFormat 属性，只能按扩展名映射）
 # 1=ppSaveAsPresentation(.ppt) 24=OpenXMLPresentation(.pptx) 25=MacroEnabled
 # 28=OpenXMLSlideShow(.ppsx) 29=OpenXMLSlideShowMacroEnabled(.ppsm)
@@ -155,16 +192,31 @@ def ensure_plaintext_dir():
     os.makedirs(PLAINTEXT_DIR, exist_ok=True)
 
 
-def unique_dest_name(src_path):
-    """在明文区生成不重名的目标路径（重名自动加序号）。"""
+def plain_dest_name(src_path, log_cb=None):
+    """明文区目标路径：与源文件同名。
+    同名旧文件（历史密文副本或上次输出）直接覆盖；仅当目标被占用
+    （如正被打开锁定）时退回加序号命名，保证输出名尽量与源一致。"""
     name = os.path.basename(src_path)
-    base, ext = os.path.splitext(name)
     dest = os.path.join(PLAINTEXT_DIR, name)
-    i = 1
-    while os.path.exists(dest):
-        dest = os.path.join(PLAINTEXT_DIR, f"{base}_{i}{ext}")
-        i += 1
-    return dest
+    if os.path.abspath(dest) == os.path.abspath(src_path):
+        return dest  # 源文件本身就在明文区（原地解密），无需清理同名
+    if not os.path.exists(dest):
+        return dest
+    try:
+        os.remove(dest)
+        if log_cb:
+            log_cb(f"    ↻ 覆盖同名旧副本: {name}")
+        return dest
+    except OSError:
+        base, ext = os.path.splitext(name)
+        i = 1
+        while os.path.exists(dest):
+            dest = os.path.join(PLAINTEXT_DIR, f"{base}_{i}{ext}")
+            i += 1
+        if log_cb:
+            log_cb(f"    ⚠ {name} 被占用（可能正被打开），输出改用 "
+                   f"{os.path.basename(dest)}")
+        return dest
 
 
 def make_work_copy(src_path):
@@ -277,8 +329,11 @@ def office_decrypt_group(office_type, items, log_cb=None, should_stop=None):
     results = {}
     pythoncom.CoInitialize()
     app = None
+    created = False   # 本实例是否为工具新建（附加到用户已打开实例时绝不能 Quit）
     try:
+        before = _office_pids(_APP_PROCESS[office_type])
         app = win32com.client.Dispatch(progid)
+        created = not (_office_pids(_APP_PROCESS[office_type]) & before)
         for attr, val in (("Visible", False), ("DisplayAlerts", False),
                           ("AutomationSecurity", 3)):  # 3=禁用宏，避免宏弹窗
             try:
@@ -292,7 +347,7 @@ def office_decrypt_group(office_type, items, log_cb=None, should_stop=None):
                     log_cb("⏹ 已停止，剩余文件未处理")
                 break
             if out is None:
-                out = unique_dest_name(src)
+                out = plain_dest_name(src, log_cb)
             t0 = time.time()
             try:
                 ok, msg = decrypt_one_office(app, office_type, src, out)
@@ -305,10 +360,13 @@ def office_decrypt_group(office_type, items, log_cb=None, should_stop=None):
                        f"[{time.time() - t0:.1f}s]")
     finally:
         if app is not None:
-            try:
-                app.Quit()
-            except Exception:
-                pass
+            if not created and log_cb:
+                log_cb("ℹ 检测到已打开的 Office 实例，仅复用不退出")
+            if created:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
             pythoncom.CoUninitialize()
     return results
 
@@ -390,6 +448,102 @@ def pdf_open_close(pdf_paths, wps_exe, timeout=PDF_POLL_TIMEOUT):
     # 收尾：等最后一个 wps 自然退出
     _wait_exit(last_proc, 10)
     return opened, len(pdf_paths) - opened
+
+
+def _decrypt_pdf_via_word(src, log_cb=None):
+    """
+    PDF 兜底路径：用 Word 打开 PDF（内容重排为可编辑文档）→ 另存为 PDF。
+    WPS 打开路径存在"关闭即回滚加密"问题（真机实测 3 个仅 1 个稳定），
+    而 Office 另存为到明文区的文件保持明文（已验证）。
+    代价：版式可能与原件有差异（Word 对 PDF 做重排版）。
+    返回 (成功?, out_path, 消息)。
+    """
+    out = plain_dest_name(src, log_cb)
+    try:
+        work = make_work_copy(src)
+    except OSError as e:
+        return False, None, f"复制到明文区失败: {e}"
+    pythoncom.CoInitialize()
+    app = None
+    created = False
+    try:
+        before = _office_pids(_APP_PROCESS["word"])
+        app = win32com.client.Dispatch("Word.Application")
+        created = not (_office_pids(_APP_PROCESS["word"]) & before)
+        for attr, val in (("Visible", False), ("DisplayAlerts", False),
+                          ("AutomationSecurity", 3)):
+            try:
+                setattr(app, attr, val)
+            except Exception:
+                pass
+        try:
+            doc = _office_open(app, "word", work)
+        except Exception as e:
+            return False, None, f"Word 无法打开该 PDF（可能为扫描件/损坏）: {e}"
+        try:
+            doc.SaveAs2(out, 17)      # 17 = wdFormatPDF
+        finally:
+            _office_close(doc)
+        # 静置复检，确认明文稳定
+        deadline = time.time() + SAVEAS_VERIFY_TIMEOUT
+        while time.time() < deadline and not is_decrypted_ok(out):
+            time.sleep(0.3)
+        if is_decrypted_ok(out):
+            time.sleep(2)
+        if is_decrypted_ok(out):
+            if log_cb:
+                log_cb("    ℹ PDF 经 Word 重排版导出，版式可能与原件略有差异")
+            return True, out, f"解密成功 → {out}"
+        return False, None, "Word 导出后文件仍不稳定（驱动未保持明文）"
+    except Exception as e:
+        return False, None, f"{type(e).__name__}: {e}"
+    finally:
+        if app is not None:
+            if created:
+                try:
+                    app.Quit()
+                except Exception:
+                    pass
+            elif log_cb:
+                log_cb("ℹ 检测到已打开的 Word 实例，仅复用不退出")
+            pythoncom.CoUninitialize()
+        discard(work)
+
+
+def _decrypt_pdf_one(src, wps_exe, log_cb=None):
+    """
+    单个 PDF 的解密：WPS 打开触发驱动解密。
+    关键（真机实测 2026-09-30）：工作副本必须**直接放在最终目标名**上，
+    不能先解密再由非白名单进程改名——对已解密文件执行改名/移动会触发
+    驱动重新加密（此前 3 个 PDF 全部因此回滚）。
+    返回 (成功?, out_path, 消息)。
+    """
+    for attempt in range(1, PDF_MAX_RETRY + 1):
+        out = plain_dest_name(src, log_cb)
+        same_file = os.path.abspath(out) == os.path.abspath(src)
+        if not same_file:
+            try:
+                shutil.copyfile(src, out)   # 副本直接落位最终名
+            except OSError as e:
+                return False, None, f"复制到明文区失败: {e}"
+        try:
+            pdf_open_close([out], wps_exe, timeout=PDF_POLL_TIMEOUT)
+        except Exception as e:
+            if not same_file:
+                discard(out)
+            return False, None, f"启动 WPS 失败: {e}"
+        if is_decrypted_ok(out):
+            cleanup_office_lock(out)
+            return True, out, f"解密成功 → {out}"
+        # 未落盘：清掉密文副本再重试（源文件本身不动）
+        if not same_file:
+            discard(out)
+        if log_cb and attempt < PDF_MAX_RETRY:
+            log_cb(f"    ↻ 第 {attempt} 次未落盘，重试…")
+    # WPS 多次尝试仍未稳定 → Word 转换兜底（另存为产生的新文件保持明文）
+    if log_cb:
+        log_cb("    ℹ WPS 路径不稳定，改用 Word 打开并另存为 PDF…")
+    return _decrypt_pdf_via_word(src, log_cb)
 
 
 # ---------- 文件收集 ----------
@@ -492,29 +646,15 @@ def decrypt_batch(paths, progress_cb=None, log_cb=None, should_stop=None):
                 continue
             if log_cb:
                 log_cb(f"\n[pdf] 启动 WPS 处理 {len(srcs)} 个 PDF…")
-            pairs = []
             for s in srcs:
+                if should_stop is not None and should_stop():
+                    _emit(s, None, False, "用户停止")
+                    continue
                 try:
-                    pairs.append((s, make_work_copy(s)))
-                except OSError as e:
-                    if log_cb:
-                        log_cb(f"    ✗ 复制失败：{e}")
-                    _emit(s, None, False, f"复制到明文区失败: {e}")
-            if pairs:
-                try:
-                    pdf_open_close([w for _, w in pairs], wps_exe,
-                                   timeout=PDF_POLL_TIMEOUT)
+                    success, out, msg = _decrypt_pdf_one(s, wps_exe, log_cb)
                 except Exception as e:
-                    if log_cb:
-                        log_cb(f"    ✗ 启动 WPS 失败：{e}")
-                for s, w in pairs:
-                    success = is_decrypted_ok(w)
-                    _emit(s, w if success else None, success,
-                          f"解密成功 → {w}" if success else "解密未完成（PDF 依赖 WPS 落盘）")
-                    if success:
-                        cleanup_office_lock(w)
-                    else:
-                        discard(w)
+                    success, out, msg = False, None, f"{type(e).__name__}: {e}"
+                _emit(s, out if success else None, success, msg)
             continue
 
         # Office：按类型分组，用一个实例逐个"打开→另存为"
@@ -548,25 +688,13 @@ def decrypt_one(src_path):
 
     office_type = get_office_type(src_path)
     ensure_plaintext_dir()
-    out = unique_dest_name(src_path)
+    out = plain_dest_name(src_path)
 
     if office_type == "pdf":
         wps_exe = find_wps_exe()
         if not wps_exe:
             return False, "", "未找到 WPS(wps.exe)，无法解密 PDF"
-        try:
-            work = make_work_copy(src_path)
-        except OSError as e:
-            return False, "", f"复制到明文区失败: {e}"
-        try:
-            pdf_open_close([work], wps_exe, timeout=PDF_POLL_TIMEOUT)
-        except Exception as e:
-            discard(work)
-            return False, "", f"启动 WPS 失败: {e}"
-        if is_decrypted_ok(work):
-            return True, work, f"解密成功 → {work}"
-        discard(work)
-        return False, "", "解密失败：文件未被 WPS 解密"
+        return _decrypt_pdf_one(src_path, wps_exe)
 
     try:
         outcome = office_decrypt_group(office_type, [(src_path, out)])
